@@ -40,6 +40,26 @@
   #chatFrames iframe { position:absolute; inset:0; width:100%; height:100%; border:0; display:none; }
   #chatFrames iframe.show { display:block; }
   #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--sub); }
+  /* フォロー一覧（右からスライドするパネル） */
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(360px, 92vw); background:var(--panel); border-left:1px solid var(--line);
+            z-index:20; transform:translateX(100%); transition:transform .2s; display:flex; flex-direction:column; }
+  #drawer.show { transform:none; box-shadow:-8px 0 24px rgba(0,0,0,.5); }
+  .dhead { display:flex; gap:6px; align-items:center; padding:8px; border-bottom:1px solid var(--line); }
+  .dhead b { flex:1; }
+  #swapBanner { display:none; background:var(--accent); padding:6px 10px; font-size:13px; align-items:center; gap:8px; }
+  #swapBanner.show { display:flex; }
+  #swapBanner span { flex:1; }
+  #dlist { flex:1; overflow-y:auto; padding:6px; -webkit-overflow-scrolling:touch; }
+  .sec { color:var(--sub); font-size:12px; margin:10px 4px 4px; }
+  .card { display:flex; gap:8px; padding:6px; border-radius:6px; cursor:pointer; align-items:center; }
+  .card:hover { background:#26262c; }
+  .card.shown { opacity:.4; }
+  .card img { width:128px; height:72px; object-fit:cover; border-radius:4px; flex:none; background:#000; }
+  .card .meta { min-width:0; font-size:12px; }
+  .card .name { font-weight:600; font-size:14px; }
+  .card .sub { color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .card .live { color:#ff4d4d; }
+  .msg { color:var(--sub); font-size:13px; padding:12px 6px; line-height:1.6; }
 </style>
 </head>
 <body>
@@ -47,6 +67,7 @@
   <form id="addForm"><input id="addInput" placeholder="チャンネル名 or URL を追加" autocomplete="off"></form>
   <div id="chips"></div>
   <span class="spacer"></span>
+  <button id="btnFollow">📺 フォロー中</button>
   <button id="btnLayout">レイアウト: グリッド</button>
   <button id="btnChat">チャット</button>
   <button id="btnFull">全画面</button>
@@ -57,6 +78,11 @@
 <div id="main">
   <div id="stage"><div id="empty">上の欄にチャンネル名を入れて Enter</div></div>
   <div id="chat"><div id="chatTabs"></div><div id="chatFrames"></div></div>
+</div>
+<div id="drawer">
+  <div class="dhead"><b>フォロー中の配信</b><button id="btnReload">更新</button><button id="btnLogout">ログアウト</button><button id="btnClose">✕</button></div>
+  <div id="swapBanner"><span></span><button id="btnSwapCancel">やめる</button></div>
+  <div id="dlist"></div>
 </div>
 
 <script src="https://player.twitch.tv/js/embed/v1.js"></script>
@@ -69,6 +95,31 @@ let layout = localStorage.getItem('tmv_layout') || 'grid'; // grid | focus
 let focusCh = null, audioCh = null, chatCh = null;
 const players = {};   // ch -> {tile, player}
 const chatFrames = {};
+let tileSeq = 0;
+
+// ===== Twitch ログイン設定 =====
+// dev.twitch.tv/console で登録したアプリの Client ID（公開しても問題ない値）
+const CLIENT_ID = 'pgn4beer4jwu7whpfgortgfsq12a5v';
+// ================================
+const REDIRECT = location.origin + location.pathname.replace(/index\.html$/, '');
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+let token = store.get('tmv_token', null);
+let me = null;            // { user_id, login }
+let recent = store.get('tmv_recent', []);
+let swapTarget = null;    // 入れ替え対象のチャンネル
+let openAfterLogin = false;
+
+// ログインから戻ってきたとき (#access_token=...)
+if (location.hash.includes('access_token=')) {
+  token = new URLSearchParams(location.hash.slice(1)).get('access_token');
+  store.set('tmv_token', token);
+  openAfterLogin = true;
+  history.replaceState(null, '', location.pathname + location.search);
+}
 
 const $ = id => document.getElementById(id);
 const stage = $('stage');
@@ -76,6 +127,11 @@ const stage = $('stage');
 function save() {
   try { localStorage.setItem('tmv_channels', JSON.stringify(channels)); localStorage.setItem('tmv_layout', layout); } catch {}
   history.replaceState(null, '', channels.length ? '?c=' + channels.join(',') : location.pathname);
+}
+
+function addRecent(ch) {
+  recent = [ch, ...recent.filter(c => c !== ch)].slice(0, 30);
+  store.set('tmv_recent', recent);
 }
 
 function normalize(s) {
@@ -88,9 +144,33 @@ function addChannel(ch) {
   ch = normalize(ch);
   if (!ch || channels.includes(ch)) return;
   channels.push(ch);
+  addRecent(ch);
   createTile(ch);
   if (!audioCh) setAudio(ch);
   if (!chatCh) chatCh = ch;
+  refresh();
+}
+
+// 同じ枠のまま配信だけ差し替える（プレイヤーを作り直さないので速い）
+function replaceChannel(old, ch) {
+  ch = normalize(ch);
+  if (!ch || ch === old || !players[old]) return;
+  const i = channels.indexOf(old), j = channels.indexOf(ch);
+  if (j >= 0) {             // すでに表示中なら位置を交換
+    [channels[i], channels[j]] = [channels[j], channels[i]];
+    refresh(); return;
+  }
+  channels[i] = ch;
+  addRecent(ch);
+  const p = players[old];
+  delete players[old];
+  players[ch] = p;
+  p.tile.dataset.ch = ch;
+  p.player.setChannel(ch);
+  chatFrames[old]?.remove(); delete chatFrames[old];
+  if (focusCh === old) focusCh = ch;
+  if (chatCh === old) chatCh = ch;
+  if (audioCh === old) audioCh = ch;
   refresh();
 }
 
@@ -107,14 +187,16 @@ function removeChannel(ch) {
 function createTile(ch) {
   const tile = document.createElement('div');
   tile.className = 'tile';
+  tile.dataset.ch = ch;   // 入れ替えで中身が変わるので、操作時はここから読む
   const holder = document.createElement('div');
-  holder.id = 'p_' + ch;
+  holder.id = 'p_' + (++tileSeq);
   tile.appendChild(holder);
   const ctrl = document.createElement('div');
   ctrl.className = 'ctrl';
-  ctrl.innerHTML = `<button data-a="audio">🔊 音声</button><button data-a="focus">⛶ 大きく</button><button data-a="chat">💬</button><button data-a="close">✕</button>`;
+  ctrl.innerHTML = `<button data-a="swap">⇄ 入れ替え</button><button data-a="audio">🔊 音声</button><button data-a="focus">⛶ 大きく</button><button data-a="chat">💬</button><button data-a="close">✕</button>`;
   ctrl.onclick = e => {
-    const a = e.target.dataset.a;
+    const a = e.target.dataset.a, ch = tile.dataset.ch;
+    if (a === 'swap') openDrawer(ch);
     if (a === 'audio') setAudio(ch);
     if (a === 'focus') { if (layout === 'focus' && focusCh === ch) layout = 'grid'; else { layout = 'focus'; focusCh = ch; } refresh(); }
     if (a === 'chat') { chatCh = ch; $('chat').classList.add('show'); refresh(); }
@@ -126,8 +208,9 @@ function createTile(ch) {
     channel: ch, parent: [PARENT], width: '100%', height: '100%', muted: true, autoplay: true,
   });
   player.addEventListener(Twitch.Player.READY, () => {
-    player.setMuted(audioCh !== ch);
-    if (audioCh === ch) player.setVolume(0.5);
+    const on = audioCh === tile.dataset.ch;
+    player.setMuted(!on);
+    if (on) player.setVolume(0.5);
   });
   players[ch] = { tile, player };
 }
@@ -216,6 +299,127 @@ function fitMain() { $('main').style.top = $('bar').offsetHeight + 'px'; }
 
 function refresh() { save(); renderBar(); renderChat(); fitMain(); doLayout(); }
 
+// ===== フォロー一覧 =====
+function login() {
+  location.href = 'https://id.twitch.tv/oauth2/authorize?response_type=token'
+    + '&client_id=' + CLIENT_ID + '&redirect_uri=' + encodeURIComponent(REDIRECT)
+    + '&scope=user%3Aread%3Afollows';
+}
+function logout() { token = null; me = null; store.del('tmv_token'); }
+
+async function api(url) {
+  const r = await fetch(url, { headers: { 'Client-Id': CLIENT_ID, Authorization: 'Bearer ' + token } });
+  if (r.status === 401) { logout(); throw new Error('auth'); }
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function getMe() {
+  if (me) return me;
+  const r = await fetch('https://id.twitch.tv/oauth2/validate', { headers: { Authorization: 'OAuth ' + token } });
+  if (!r.ok) { logout(); throw new Error('auth'); }
+  return (me = await r.json());
+}
+
+async function fetchFollowedLive() {
+  const { user_id } = await getMe();
+  const out = [];
+  let cursor = '';
+  do {
+    const j = await api(`https://api.twitch.tv/helix/streams/followed?user_id=${user_id}&first=100${cursor ? '&after=' + cursor : ''}`);
+    out.push(...j.data);
+    cursor = j.pagination?.cursor;
+  } while (cursor && out.length < 300);
+  return out;
+}
+
+// 最近見たチャンネルのうち配信中のもの
+async function fetchLive(logins) {
+  if (!logins.length) return [];
+  const j = await api('https://api.twitch.tv/helix/streams?first=100&' + logins.slice(0, 100).map(l => 'user_login=' + l).join('&'));
+  return j.data;
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function cardHTML(s) {
+  const thumb = s.thumbnail_url ? s.thumbnail_url.replace('{width}', '256').replace('{height}', '144') + '?t=' + Math.floor(Date.now() / 60000) : '';
+  const shown = channels.includes(s.user_login) ? ' shown' : '';
+  return `<div class="card${shown}" data-ch="${esc(s.user_login)}">
+    ${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ''}
+    <div class="meta">
+      <div class="name">${esc(s.user_name || s.user_login)}</div>
+      ${s.game_name !== undefined ? `<div class="sub">${esc(s.game_name)}</div>
+      <div class="sub"><span class="live">● ${Number(s.viewer_count).toLocaleString()}</span> ${esc(s.title)}</div>` : '<div class="sub">オフライン / 不明</div>'}
+    </div></div>`;
+}
+
+let drawerTimer = null;
+async function renderDrawer() {
+  const list = $('dlist');
+  $('btnLogout').style.display = token ? '' : 'none';
+  $('btnReload').style.display = token ? '' : 'none';
+  const offlineRecent = () => {
+    const rs = recent.filter(c => !channels.includes(c));
+    return rs.length ? '<div class="sec">最近見たチャンネル</div>' + rs.map(c => cardHTML({ user_login: c })).join('') : '';
+  };
+  if (!CLIENT_ID) {
+    list.innerHTML = '<div class="msg">Client ID が未設定のため、フォロー一覧は使えません。</div>' + offlineRecent();
+    return;
+  }
+  if (!token) {
+    list.innerHTML = '<div class="msg">Twitch にログインすると、フォロー中で配信している人がここに並びます。<br><br><button id="btnLogin">Twitch でログイン</button></div>' + offlineRecent();
+    $('btnLogin').onclick = login;
+    return;
+  }
+  if (!list.children.length) list.innerHTML = '<div class="msg">読み込み中…</div>';
+  try {
+    const live = await fetchFollowedLive();
+    const liveSet = new Set(live.map(s => s.user_login));
+    const others = recent.filter(c => !liveSet.has(c) && !channels.includes(c));
+    const recentLive = (await fetchLive(others)).filter(s => !liveSet.has(s.user_login));
+    const recentLiveSet = new Set(recentLive.map(s => s.user_login));
+    const recentOff = others.filter(c => !recentLiveSet.has(c));
+    list.innerHTML =
+      `<div class="sec">フォロー中・配信中（${live.length}）</div>`
+      + (live.length ? live.map(cardHTML).join('') : '<div class="msg">いま配信中のフォローはいません</div>')
+      + (recentLive.length ? '<div class="sec">最近見た・配信中</div>' + recentLive.map(cardHTML).join('') : '')
+      + (recentOff.length ? '<div class="sec">最近見た・オフライン</div>' + recentOff.map(c => cardHTML({ user_login: c })).join('') : '');
+  } catch (e) {
+    if (e.message === 'auth') return renderDrawer();   // トークン切れ → ログインボタン表示
+    list.innerHTML = '<div class="msg">読み込みに失敗しました（' + esc(e.message) + '）</div>' + offlineRecent();
+  }
+}
+
+function openDrawer(target = null) {
+  swapTarget = target;
+  $('swapBanner').classList.toggle('show', !!target);
+  $('swapBanner').querySelector('span').textContent = target ? `「${target}」と入れ替える配信を選択` : '';
+  $('drawer').classList.add('show');
+  renderDrawer();
+  clearInterval(drawerTimer);
+  drawerTimer = setInterval(renderDrawer, 60000);
+}
+function closeDrawer() {
+  $('drawer').classList.remove('show');
+  $('swapBanner').classList.remove('show');
+  swapTarget = null;
+  clearInterval(drawerTimer);
+}
+
+$('dlist').addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  const ch = card.dataset.ch;
+  if (swapTarget) { replaceChannel(swapTarget, ch); closeDrawer(); }
+  else { addChannel(ch); renderDrawer(); }
+});
+$('btnFollow').onclick = () => $('drawer').classList.contains('show') ? closeDrawer() : openDrawer();
+$('btnClose').onclick = closeDrawer;
+$('btnSwapCancel').onclick = () => { swapTarget = null; $('swapBanner').classList.remove('show'); };
+$('btnReload').onclick = renderDrawer;
+$('btnLogout').onclick = () => { logout(); renderDrawer(); };
+
 $('addForm').onsubmit = e => {
   e.preventDefault();
   $('addInput').value.split(/[\s,]+/).forEach(addChannel);
@@ -237,10 +441,11 @@ document.addEventListener('keydown', e => {
 });
 new ResizeObserver(() => { fitMain(); doLayout(); }).observe(document.body);
 
-channels.forEach(createTile);
+channels.forEach(c => { createTile(c); if (!recent.includes(c)) addRecent(c); });
 audioCh = channels[0] || null; chatCh = channels[0] || null;
 if (audioCh) setAudio(audioCh);
 refresh();
+if (openAfterLogin) openDrawer();
 </script>
 </body>
 </html>
