@@ -32,6 +32,12 @@
   .ctrl button { background:rgba(0,0,0,.7); font-size:12px; }
   .ctrl button.on { background:var(--accent); }
   .tile.audio { outline:2px solid var(--accent); outline-offset:-2px; }
+  /* ニコニコ風コメント */
+  .dm { position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:1; }
+  .dm span { position:absolute; left:0; white-space:nowrap; font-weight:700; color:#fff; will-change:transform;
+             text-shadow:-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 4px #000; }
+  .dm img { height:1.1em; vertical-align:middle; }
+  body.nodm .dm { display:none; }
   #chat { width:340px; border-left:1px solid var(--line); display:none; flex-direction:column; background:var(--panel); }
   #chat.show { display:flex; }
   #chatTabs { display:flex; gap:4px; padding:4px; flex-wrap:wrap; }
@@ -69,6 +75,7 @@
   <span class="spacer"></span>
   <button id="btnFollow">📺 フォロー中</button>
   <button id="btnLayout">レイアウト: グリッド</button>
+  <button id="btnDm">コメント流す</button>
   <button id="btnChat">チャット</button>
   <button id="btnFull">全画面</button>
   <button id="btnHide">バーを隠す</button>
@@ -297,7 +304,115 @@ function renderBar() {
 
 function fitMain() { $('main').style.top = $('bar').offsetHeight + 'px'; }
 
-function refresh() { save(); renderBar(); renderChat(); fitMain(); doLayout(); }
+function refresh() { save(); renderBar(); renderChat(); fitMain(); doLayout(); syncIrc(); }
+
+// ===== ニコニコ風コメント（Twitch チャットを匿名で読み取り） =====
+let dmOn = store.get('tmv_dm', true);
+let irc = null, ircReady = false, ircRetry = 1000;
+const joined = new Set();
+const lanes = new WeakMap();   // layer -> [{end, speed, w, t0}]
+
+function connectIrc() {
+  irc = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+  irc.onopen = () => {
+    irc.send('CAP REQ :twitch.tv/tags');
+    irc.send('PASS SCHMOOPIIE');
+    irc.send('NICK justinfan' + Math.floor(10000 + Math.random() * 80000));
+    ircReady = true; ircRetry = 1000;
+    joined.clear(); syncIrc();
+  };
+  irc.onmessage = e => e.data.split('\r\n').forEach(onIrcLine);
+  irc.onclose = () => { ircReady = false; setTimeout(connectIrc, ircRetry); ircRetry = Math.min(ircRetry * 2, 30000); };
+}
+
+function syncIrc() {
+  if (!ircReady) return;
+  const want = new Set(dmOn ? channels : []);
+  for (const c of joined) if (!want.has(c)) { irc.send('PART #' + c); joined.delete(c); }
+  for (const c of want) if (!joined.has(c)) { irc.send('JOIN #' + c); joined.add(c); }
+}
+
+function onIrcLine(line) {
+  if (!line) return;
+  if (line.startsWith('PING')) { irc.send('PONG' + line.slice(4)); return; }
+  // @tags :user!user@user.tmi.twitch.tv PRIVMSG #channel :message
+  const m = line.match(/^(?:@(\S+) )?:\S+ PRIVMSG #(\w+) :(.*)$/);
+  if (!m || !dmOn || document.hidden) return;
+  const tags = Object.fromEntries((m[1] || '').split(';').map(kv => kv.split('=')));
+  let text = m[3];
+  if (text.startsWith('\u0001ACTION ')) text = text.slice(8, -1);   // /me
+  shoot(m[2], text, tags.emotes || '');
+}
+
+// エモート位置 (id:0-4,6-10/id2:...) を画像に置き換えた HTML を作る
+function msgHTML(text, emotes) {
+  const chars = [...text];
+  const marks = [];
+  for (const part of emotes.split('/').filter(Boolean)) {
+    const [id, ranges] = part.split(':');
+    for (const r of ranges.split(',')) { const [a, b] = r.split('-').map(Number); marks.push([a, b, id]); }
+  }
+  marks.sort((x, y) => x[0] - y[0]);
+  let out = '', i = 0;
+  for (const [a, b, id] of marks) {
+    out += esc(chars.slice(i, a).join(''));
+    out += `<img src="https://static-cdn.jtvnw.net/emoticons/v2/${esc(id)}/default/dark/1.0" alt="">`;
+    i = b + 1;
+  }
+  return out + esc(chars.slice(i).join(''));
+}
+
+function shoot(ch, text, emotes) {
+  const p = players[ch];
+  if (!p) return;
+  let layer = p.tile.querySelector('.dm');
+  if (!layer) { layer = document.createElement('div'); layer.className = 'dm'; p.tile.appendChild(layer); }
+  if (layer.dataset.ch !== ch) { layer.innerHTML = ''; layer.dataset.ch = ch; lanes.delete(layer); }
+  if (layer.childElementCount > 80) return;   // 多すぎるときは間引く
+
+  const W = layer.clientWidth, H = layer.clientHeight;
+  if (!W || !H) return;
+  const fs = Math.max(14, Math.min(40, H / 13));
+  const lineH = fs * 1.3;
+  const n = Math.max(1, Math.floor(H / lineH));
+  const el = document.createElement('span');
+  el.style.fontSize = fs + 'px';
+  el.style.visibility = 'hidden';
+  el.innerHTML = msgHTML(text, emotes);
+  layer.appendChild(el);
+  const w = el.offsetWidth;
+
+  // ニコニコと同じく「画面を横切る時間」は一定 → 長いコメントほど速い
+  const dur = 5000, speed = (W + w) / dur, now = performance.now();
+  let ls = lanes.get(layer);
+  if (!ls || ls.length !== n) { ls = Array.from({ length: n }, () => null); lanes.set(layer, ls); }
+  // 前のコメントに追いつかない最初のレーンを使う。空きがなければ重ねる
+  let lane = ls.findIndex(prev => {
+    if (!prev) return true;
+    const el2 = now - prev.t0;
+    if (el2 * prev.speed < prev.w + fs) return false;              // 前のがまだ入りきっていない
+    const prevLeft = (W + prev.w) / prev.speed - el2;              // 前のが消えるまでの時間
+    return W / speed >= prevLeft;                                   // 追いつかない
+  });
+  if (lane < 0) lane = Math.floor(Math.random() * n);
+  ls[lane] = { t0: now, speed, w };
+
+  el.style.top = (lane * lineH + (H - n * lineH) / 2) + 'px';
+  el.style.visibility = '';
+  el.animate([{ transform: `translateX(${W}px)` }, { transform: `translateX(${-w}px)` }], { duration: dur, easing: 'linear' })
+    .onfinish = () => el.remove();
+}
+
+function setDm(on) {
+  dmOn = on; store.set('tmv_dm', on);
+  document.body.classList.toggle('nodm', !on);
+  if (!on) document.querySelectorAll('.dm').forEach(l => l.innerHTML = '');
+  $('btnDm').classList.toggle('on', on);
+  syncIrc();
+}
+$('btnDm').onclick = () => setDm(!dmOn);
+setDm(dmOn);
+connectIrc();
 
 // ===== フォロー一覧 =====
 function login() {
